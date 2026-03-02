@@ -6,7 +6,7 @@ import os
 
 app = FastAPI()
 
-# Permite peticiones desde cualquier origen (Evita bloqueos durante pruebas)
+# Permite peticiones desde cualquier origen (Evita bloqueos de CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -53,7 +53,7 @@ async def analizar_discrepancia(solicitud: SolicitudAnalisis):
         return {"analisis_legal": response.text.strip()}
 
     except Exception as e:
-        print(f"Error interno: {str(e)}") # Esto se verá en los logs de Render si falla
+        print(f"Error interno: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en el procesamiento de IA: {str(e)}")
 
 @app.get("/ping")
