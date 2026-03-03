@@ -9,7 +9,7 @@ import re
 
 app = FastAPI()
 
-# Configuración CORS para permitir peticiones desde tu frontend
+# Configuración CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -18,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inicialización del cliente de Gemini
+# Inicialización del cliente Gemini
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
@@ -39,6 +39,11 @@ class SolicitudRiskScore(BaseModel):
 class DatosConciliacion(BaseModel):
     bancos: list
     facturas: list
+
+class SolicitudTasaEfectiva(BaseModel):
+    ingresos: float
+    isr_pagado: float
+    sector: str
 
 
 # ---------------- ENDPOINTS ----------------
@@ -260,6 +265,35 @@ async def validar_materialidad(contrato: UploadFile = File(...), datos_xml: str 
             ]
         )
         
+        texto_limpio = re.sub(r'```json\n|```', '', response.text).strip()
+        return json.loads(texto_limpio)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/tasa-efectiva")
+async def evaluar_tasa_efectiva(datos: SolicitudTasaEfectiva):
+    try:
+        tasa_calculada = (datos.isr_pagado / datos.ingresos) * 100 if datos.ingresos > 0 else 0
+        prompt = f"""
+        Eres un auditor del SAT experto en el Plan Maestro de Fiscalización. 
+        Evalúa el riesgo de auditoría de una empresa del sector: '{datos.sector}'.
+        Su Tasa Efectiva de ISR calculada es {tasa_calculada:.2f}%.
+        
+        1. Evalúa si esta tasa es congruente o sospechosamente baja para los márgenes de utilidad normales de este sector en México.
+        2. Proporciona una advertencia ejecutiva (máximo 4 renglones) sobre la probabilidad de revisión profunda.
+        
+        Devuelve ÚNICAMENTE un JSON estricto sin bloques markdown:
+        {{
+            "tasa_calculada": {tasa_calculada:.2f},
+            "nivel_riesgo": "ALTO" | "MEDIO" | "BAJO",
+            "dictamen_sectorial": "Análisis legal y sectorial."
+        }}
+        """
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
         texto_limpio = re.sub(r'```json\n|```', '', response.text).strip()
         return json.loads(texto_limpio)
     except Exception as e:
