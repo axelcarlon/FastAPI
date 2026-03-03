@@ -45,6 +45,9 @@ class SolicitudTasaEfectiva(BaseModel):
     isr_pagado: float
     sector: str
 
+class SolicitudAduana(BaseModel):
+    conceptos: list
+
 
 # ---------------- ENDPOINTS ----------------
 
@@ -294,6 +297,94 @@ async def evaluar_tasa_efectiva(datos: SolicitudTasaEfectiva):
             model='gemini-2.5-flash',
             contents=prompt
         )
+        texto_limpio = re.sub(r'```json\n|```', '', response.text).strip()
+        return json.loads(texto_limpio)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------- NUEVOS ENDPOINTS (ÚLTIMA FASE) ----------------
+
+@app.post("/api/auditoria-activos")
+async def auditoria_activos(foto: UploadFile = File(...), datos_xml: str = Form(...)):
+    try:
+        file_bytes = await foto.read()
+        mime_type = foto.content_type
+        
+        prompt = f"""
+        Actúa como perito en materialidad fiscal para comprobación de activos fijos en México. 
+        Tu objetivo es extraer texto de la placa de identificación, número de serie, modelo o marca de la maquinaria/equipo en la FOTO ADJUNTA.
+        Compara la extracción visual con el siguiente concepto facturado en el XML: {datos_xml}.
+        
+        Devuelve ÚNICAMENTE un JSON válido con esta estructura, sin bloques markdown:
+        {{
+            "coincidencia": bool, 
+            "datos_extraidos_foto": "string (lo que pudiste leer en la imagen)", 
+            "dictamen_materialidad": "Explicación breve de si la foto sirve como prueba documental de existencia del activo facturado."
+        }}
+        """
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash', 
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt]
+        )
+        
+        texto_limpio = re.sub(r'```json\n|```', '', response.text).strip()
+        return json.loads(texto_limpio)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/precios-aduana")
+async def precios_aduana(datos: SolicitudAduana):
+    try:
+        prompt = f"""
+        Eres un agente aduanal de la ANAM y auditor del SAT experto en Precios de Transferencia. 
+        Analiza la siguiente lista de conceptos de importación/exportación extraídos de XMLs: {json.dumps(datos.conceptos)}.
+        Indica si las Claves ProdServ y los valores unitarios presentan un riesgo visible de subvaluación (compras sospechosamente baratas en el extranjero) o problemas aduaneros.
+        
+        Devuelve ÚNICAMENTE un JSON válido con esta estructura, sin bloques markdown:
+        {{
+            "nivel_riesgo_aduanero": "ALTO" o "MEDIO" o "BAJO", 
+            "analisis_valoracion": "Explicación directa del riesgo de los precios declarados frente a referencias internacionales o lógicas de mercado."
+        }}
+        """
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash', 
+            contents=prompt
+        )
+        
+        texto_limpio = re.sub(r'```json\n|```', '', response.text).strip()
+        return json.loads(texto_limpio)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/prueba-servicio")
+async def prueba_servicio(evidencia: UploadFile = File(...), datos_xml: str = Form(...)):
+    try:
+        file_bytes = await evidencia.read()
+        mime_type = evidencia.content_type
+        
+        prompt = f"""
+        Eres un Auditor del SAT evaluando listas de EFOS y la materialidad de servicios intangibles (Art. 69-B del CFF).
+        El usuario ha subido un archivo de evidencia documental (ej. reporte técnico, minuta, captura de correo, fotos) para amparar el siguiente concepto cobrado en una factura XML: {datos_xml}.
+        Evalúa si el contenido visual y textual del documento adjunto tiene el peso semántico para justificar que el servicio facturado realmente se prestó.
+        
+        Devuelve ÚNICAMENTE un JSON válido con esta estructura, sin bloques markdown:
+        {{
+            "sustancia_economica_comprobada": bool, 
+            "nivel_riesgo_efos": "ALTO" o "MEDIO" o "BAJO", 
+            "dictamen_evidencia": "Justificación legal de por qué esta prueba salva (o condena) la deducción del comprobante."
+        }}
+        """
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash', 
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt]
+        )
+        
         texto_limpio = re.sub(r'```json\n|```', '', response.text).strip()
         return json.loads(texto_limpio)
     except Exception as e:
