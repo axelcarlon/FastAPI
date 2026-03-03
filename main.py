@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
@@ -219,6 +219,45 @@ async def conciliacion_fuzzy(datos: DatosConciliacion):
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[prompt, json.dumps(contenido)]
+        )
+        
+        texto_limpio = re.sub(r'```json\n|```', '', response.text).strip()
+        return json.loads(texto_limpio)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/materialidad")
+async def validar_materialidad(contrato: UploadFile = File(...), datos_xml: str = Form(...)):
+    try:
+        file_bytes = await contrato.read()
+        mime_type = contrato.content_type
+        
+        prompt_materialidad = f"""
+        Eres un Auditor Fiscal del SAT de México especializado en el Art. 5-A y 69-B del CFF (Materialidad y Razón de Negocios).
+        Analiza el CONTRATO ADJUNTO y compáralo estrictamente contra los siguientes datos extraídos de la FACTURA (XML):
+        {datos_xml}
+        
+        Evalúa 3 puntos:
+        1. Congruencia del Objeto: ¿El concepto facturado está amparado en las cláusulas del contrato?
+        2. Congruencia de Importes: ¿El monto facturado coincide con las contraprestaciones estipuladas?
+        3. Vigencia: ¿La fecha de la factura está dentro de la vigencia del contrato?
+
+        Devuelve ÚNICAMENTE un JSON válido con la siguiente estructura, sin bloques markdown:
+        {{
+            "nivel_riesgo": "BAJO" o "MEDIO" o "ALTO",
+            "porcentaje_coincidencia": int (0 a 100),
+            "dictamen_defensa": "Argumento legal sobre si la operación tiene sustancia económica o si puede ser rechazada por el SAT",
+            "hallazgos": ["lista de discrepancias o confirmaciones"]
+        }}
+        """
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                prompt_materialidad
+            ]
         )
         
         texto_limpio = re.sub(r'```json\n|```', '', response.text).strip()
