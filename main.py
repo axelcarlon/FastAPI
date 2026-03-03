@@ -21,6 +21,7 @@ app.add_middleware(
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
+# ---------------- MODELOS DE DATOS ----------------
 class SolicitudAnalisis(BaseModel):
     tipo_documento: str
     error_detectado: str
@@ -49,6 +50,8 @@ class SolicitudAduana(BaseModel):
 def extraer_json(texto: str):
     texto = re.sub(r'```json\n|```', '', texto).strip()
     return json.loads(texto)
+
+# ---------------- ENDPOINTS GENERALES E IA ----------------
 
 @app.get("/ping")
 async def ping():
@@ -93,6 +96,8 @@ async def chat_asesor(datos: MensajeChat):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ---------------- ENDPOINTS OPERATIVOS Y MULTIMODALES ----------------
+
 @app.post("/api/ocr-fiscal")
 async def ocr_fiscal(archivos: List[UploadFile] = File(...)):
     try:
@@ -123,13 +128,12 @@ async def ocr_fiscal(archivos: List[UploadFile] = File(...)):
                 calc = round(sub + tras - ret, 2)
                 
                 if abs(calc - tot) > 0.10:
-                    resultados.append({"archivo": archivo.filename, "status": "error_matematico", "mensaje": f"Discrepancia detectada. Matemáticas: ${calc}. Documento marca: ${tot}.", "datos_extraidos": datos})
+                    resultados.append({"archivo": archivo.filename, "status": "error_matematico", "mensaje": f"Discrepancia. Matemáticas: {calc}, Documento: {tot}"})
                 else:
                     resultados.append({"archivo": archivo.filename, "status": "success", "datos": datos})
             except:
                 resultados.append({"archivo": archivo.filename, "status": "error", "mensaje": "Falla al estructurar datos."})
-        
-        # Compatibilidad hacia atrás si solo se sube 1 archivo para que el frontend actual no rompa
+                
         if len(resultados) == 1:
             if resultados[0]["status"] == "success":
                 return {"status": "success", "datos": resultados[0]["datos"]}
@@ -305,7 +309,7 @@ async def defensa_legal(documento: UploadFile = File(...)):
         NO incluyas marcas de agua, ni texto como 'Generado por IA', ni asteriscos de markdown. Solo el texto legal puro listo para firma.
         """
         response = client.models.generate_content(
-            model='gemini-2.5-pro', # Modelo pro para textos legales largos
+            model='gemini-2.5-pro',
             contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
             config=types.GenerateContentConfig(
                 tools=[{"google_search": {}}],
@@ -313,5 +317,44 @@ async def defensa_legal(documento: UploadFile = File(...)):
             )
         )
         return {"oficio_legal": response.text.strip()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/banco-csv")
+async def banco_csv(documento: UploadFile = File(...)):
+    try:
+        file_bytes = await documento.read()
+        mime_type = documento.content_type
+        prompt = """
+        Eres un extractor financiero. Analiza el estado de cuenta bancario adjunto (PDF o Imagen).
+        Extrae todas las transacciones y devuélvelas ÚNICAMENTE en formato CSV con las siguientes columnas exactas:
+        Fecha (DD/MM/AAAA),Concepto,Cargo,Abono,Saldo
+        No incluyas texto adicional, ni saludos, ni bloques markdown. Solo el texto CSV puro.
+        """
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt]
+        )
+        return {"csv_data": response.text.strip()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/analista-csf")
+async def analista_csf(documento: UploadFile = File(...)):
+    try:
+        file_bytes = await documento.read()
+        mime_type = documento.content_type
+        prompt = """
+        Analiza el documento adjunto. Es una Constancia de Situación Fiscal o una Opinión de Cumplimiento (32-D) del SAT.
+        Extrae la siguiente información y devuelve ÚNICAMENTE un JSON válido:
+        {"rfc": "str", "razon_social": "str", "regimen_fiscal": ["str"], "codigo_postal": "str", "estatus_cumplimiento": "POSITIVA"|"NEGATIVA"|"NO DETECTADO", "alertas": ["str"]}
+        Si es un 32-D negativo, extrae el motivo en las alertas.
+        """
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        return json.loads(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
