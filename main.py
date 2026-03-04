@@ -9,8 +9,7 @@ import os
 import re
 import logging
 
-# ---------------- CONFIGURACIÓN CORPORATIVA (BIG 4) ----------------
-# Configuración de Logs para trazabilidad exacta en Render
+# ---------------- CONFIGURACIÓN CORPORATIVA ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -63,17 +62,14 @@ class SolicitudAduana(BaseModel):
 
 def extraer_json(texto: str):
     """
-    Extractor de JSON indestructible. Previene el 90% de los Errores 500 
-    causados por respuestas impuras de la Inteligencia Artificial.
+    Extractor de JSON para prevenir Errores 500 causados por respuestas impuras de la IA.
     """
     try:
-        # Intento 1: Limpieza básica de Markdown
         texto_limpio = re.sub(r'```json\n|```', '', texto).strip()
         return json.loads(texto_limpio)
     except json.JSONDecodeError as e:
         logging.warning(f"Fallo de parseo JSON estándar, intentando extracción profunda: {e}")
         try:
-            # Intento 2: Extracción por delimitadores (Corta basura antes o después del JSON)
             inicio = texto.find('{')
             fin = texto.rfind('}')
             if inicio != -1 and fin != -1:
@@ -86,8 +82,7 @@ def extraer_json(texto: str):
 
 def sanitizar_mime_type(filename: str, current_mime: str) -> str:
     """
-    Previene que el servidor de Google rechaze el archivo si el navegador 
-    lo envía como 'octet-stream' genérico.
+    Previene que el servidor rechace el archivo si el navegador lo envía como 'octet-stream'.
     """
     if not current_mime or current_mime == "application/octet-stream":
         ext = filename.split('.')[-1].lower() if filename else ""
@@ -411,10 +406,13 @@ async def analista_csf(documento: UploadFile = File(...)):
         mime_seguro = sanitizar_mime_type(documento.filename, documento.content_type)
         
         prompt = """
-        Analiza el documento adjunto. Es una Constancia de Situación Fiscal o una Opinión de Cumplimiento (32-D) del SAT.
-        Extrae la siguiente información y devuelve ÚNICAMENTE un JSON válido:
-        {"rfc": "str", "razon_social": "str", "regimen_fiscal": ["str"], "codigo_postal": "str", "estatus_cumplimiento": "POSITIVA"|"NEGATIVA"|"NO DETECTADO", "alertas": ["str"]}
-        Si es un 32-D negativo, extrae el motivo en las alertas.
+        Auditor Fiscal. Analiza el documento adjunto.
+        Determina si es "Constancia de Situación Fiscal" (CSF) o "Opinión de Cumplimiento 32-D".
+        Extrae la información y devuelve ÚNICAMENTE un JSON válido:
+        {"rfc": "str", "razon_social": "str", "regimen_fiscal": ["str"], "codigo_postal": "str", "tipo_documento": "CSF" | "32-D", "estatus_cumplimiento": "str", "alertas": ["str"]}
+        REGLAS CLAVE:
+        1. Si es CSF: En 'estatus_cumplimiento' extrae el Estatus en el padrón (ej. "ACTIVO" o "SUSPENDIDO").
+        2. Si es 32-D: En 'estatus_cumplimiento' extrae "POSITIVA" o "NEGATIVA". Si es NEGATIVA, extrae el motivo en 'alertas'.
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash',
