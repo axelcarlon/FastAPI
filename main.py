@@ -8,7 +8,9 @@ import json
 import os
 import re
 import logging
+import tempfile
 
+# ---------------- CONFIGURACIÓN CORPORATIVA ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -31,6 +33,7 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
+# ---------------- MODELOS DE DATOS ----------------
 class SolicitudAnalisis(BaseModel):
     tipo_documento: str
     error_detectado: str
@@ -56,7 +59,12 @@ class SolicitudTasaEfectiva(BaseModel):
 class SolicitudAduana(BaseModel):
     conceptos: list
 
+# ---------------- MOTORES DE BLINDAJE ----------------
+
 def extraer_json(texto: str):
+    """
+    Extractor de JSON blindado. Previene Errores 500 causados por respuestas impuras de la IA.
+    """
     texto_limpio = texto.strip()
     if texto_limpio.startswith("```json"):
         texto_limpio = texto_limpio[7:]
@@ -82,12 +90,15 @@ def extraer_json(texto: str):
         raise ValueError("Imposible decodificar la estructura JSON de la IA")
 
 def reparar_mime_type(filename: str, current_mime: str) -> str:
+    """Previene rechazos de la API asegurando el formato exacto del archivo."""
     if not current_mime or current_mime == "application/octet-stream":
         ext = filename.split('.')[-1].lower() if filename else ""
         if ext == "pdf": return "application/pdf"
         elif ext in ["jpg", "jpeg"]: return "image/jpeg"
         elif ext == "png": return "image/png"
     return current_mime if current_mime else "application/pdf"
+
+# ---------------- ENDPOINTS GENERALES E IA ----------------
 
 @app.get("/ping")
 async def ping():
@@ -132,6 +143,70 @@ async def chat_asesor(datos: MensajeChat):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ---------------- ENDPOINTS OPERATIVOS Y MULTIMODALES ----------------
+
+@app.post("/api/analista-csf")
+async def analista_csf(documento: UploadFile = File(...)):
+    tmp_path = None
+    uploaded_file = None
+    try:
+        file_bytes = await documento.read()
+        mime_seguro = reparar_mime_type(documento.filename, documento.content_type)
+        
+        # 1. Guardado temporal para usar la API de Archivos de Gemini (Soporta PDFs ilimitados sin colapsar)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+            
+        # 2. Subida segura a Google
+        uploaded_file = client.files.upload(file=tmp_path, mime_type=mime_seguro)
+        
+        # 3. Prompt estricto con JSON inmaculado
+        prompt = """
+        Eres un Auditor Fiscal. Analiza el documento oficial adjunto.
+        Determina si es una "Constancia de Situación Fiscal" (CSF) o una "Opinión de Cumplimiento 32-D".
+        Extrae los datos solicitados y devuelve ÚNICAMENTE un JSON válido con la siguiente estructura exacta:
+        {
+            "rfc": "string",
+            "razon_social": "string",
+            "regimen_fiscal": ["string"],
+            "codigo_postal": "string",
+            "tipo_documento": "string",
+            "estatus_cumplimiento": "string",
+            "alertas": ["string"]
+        }
+        REGLAS ESTRICTAS:
+        1. 'tipo_documento' debe ser exclusivamente "CSF" o "32-D".
+        2. Si es CSF, 'estatus_cumplimiento' debe ser el Estatus en el padrón (ej. "ACTIVO" o "SUSPENDIDO").
+        3. Si es 32-D, 'estatus_cumplimiento' debe ser "POSITIVA" o "NEGATIVA".
+        4. Si no hay alertas o irregularidades, devuelve un arreglo vacío [] en 'alertas'.
+        """
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[uploaded_file, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
+        )
+        
+        return extraer_json(response.text)
+        
+    except Exception as e:
+        logging.error(f"Error crítico en /api/analista-csf: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Fallo del motor central: {str(e)}")
+    finally:
+        # 4. Destrucción de archivos (Zero-Retention)
+        if uploaded_file:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except:
+                pass
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 @app.post("/api/ocr-fiscal")
 async def ocr_fiscal(archivos: List[UploadFile] = File(...)):
     try:
@@ -166,7 +241,8 @@ async def ocr_fiscal(archivos: List[UploadFile] = File(...)):
                     resultados.append({"archivo": archivo.filename, "status": "error_matematico", "mensaje": f"Discrepancia. Matemáticas: {calc}, Documento: {tot}"})
                 else:
                     resultados.append({"archivo": archivo.filename, "status": "success", "datos": datos})
-            except:
+            except Exception as json_err:
+                logging.error(f"Error procesando JSON de OCR: {str(json_err)}")
                 resultados.append({"archivo": archivo.filename, "status": "error", "mensaje": "Falla al estructurar datos."})
                 
         if len(resultados) == 1:
@@ -216,9 +292,17 @@ async def conciliacion_fuzzy(datos: DatosConciliacion):
 
 @app.post("/api/materialidad")
 async def validar_materialidad(contrato: UploadFile = File(...), datos_xml: str = Form(...)):
+    tmp_path = None
+    uploaded_file = None
     try:
         file_bytes = await contrato.read()
         mime_seguro = reparar_mime_type(contrato.filename, contrato.content_type)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+            
+        uploaded_file = client.files.upload(file=tmp_path, mime_type=mime_seguro)
         
         prompt = f"""
         Auditor Forense (Art. 5-A). Cruza CONTRATO vs FACTURA XML: {datos_xml}.
@@ -234,12 +318,18 @@ async def validar_materialidad(contrato: UploadFile = File(...), datos_xml: str 
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash', 
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_seguro), prompt],
+            contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
         return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if uploaded_file:
+            try: client.files.delete(name=uploaded_file.name)
+            except: pass
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 @app.post("/api/tasa-efectiva")
 async def evaluar_tasa_efectiva(datos: SolicitudTasaEfectiva):
@@ -314,9 +404,17 @@ async def precios_aduana(datos: SolicitudAduana):
 
 @app.post("/api/prueba-servicio")
 async def prueba_servicio(evidencia: UploadFile = File(...), datos_xml: str = Form(...)):
+    tmp_path = None
+    uploaded_file = None
     try:
         file_bytes = await evidencia.read()
         mime_seguro = reparar_mime_type(evidencia.filename, evidencia.content_type)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+            
+        uploaded_file = client.files.upload(file=tmp_path, mime_type=mime_seguro)
         
         prompt = f"""
         Auditor SAT (Art. 69-B). Evalúa evidencia adjunta contra XML: {datos_xml}.
@@ -331,12 +429,18 @@ async def prueba_servicio(evidencia: UploadFile = File(...), datos_xml: str = Fo
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash', 
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_seguro), prompt],
+            contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if uploaded_file:
+            try: client.files.delete(name=uploaded_file.name)
+            except: pass
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 @app.post("/api/viaticos-geo")
 async def viaticos_geo(datos_xml: str = Form(...)):
@@ -364,9 +468,17 @@ async def viaticos_geo(datos_xml: str = Form(...)):
 
 @app.post("/api/defensa-legal")
 async def defensa_legal(documento: UploadFile = File(...)):
+    tmp_path = None
+    uploaded_file = None
     try:
         file_bytes = await documento.read()
         mime_seguro = reparar_mime_type(documento.filename, documento.content_type)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+            
+        uploaded_file = client.files.upload(file=tmp_path, mime_type=mime_seguro)
         
         prompt = """
         Eres un abogado fiscalista senior. El documento adjunto es un requerimiento, multa o Carta Invitación del SAT.
@@ -376,7 +488,7 @@ async def defensa_legal(documento: UploadFile = File(...)):
         """
         response = client.models.generate_content(
             model='gemini-2.5-pro',
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_seguro), prompt],
+            contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(
                 tools=[{"google_search": {}}],
                 temperature=0.2
@@ -385,6 +497,12 @@ async def defensa_legal(documento: UploadFile = File(...)):
         return {"oficio_legal": response.text.strip()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if uploaded_file:
+            try: client.files.delete(name=uploaded_file.name)
+            except: pass
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 @app.post("/api/banco-csv")
 async def banco_csv(documento: UploadFile = File(...)):
@@ -404,34 +522,4 @@ async def banco_csv(documento: UploadFile = File(...)):
         )
         return {"csv_data": response.text.strip()}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/analista-csf")
-async def analista_csf(documento: UploadFile = File(...)):
-    try:
-        file_bytes = await documento.read()
-        mime_seguro = reparar_mime_type(documento.filename, documento.content_type)
-        
-        prompt = """
-        Extrae los datos del documento (Constancia de Situación Fiscal o 32-D).
-        Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta:
-        {
-            "rfc": "valor",
-            "razon_social": "valor",
-            "regimen_fiscal": ["valor1"],
-            "codigo_postal": "valor",
-            "tipo_documento": "CSF o 32-D",
-            "estatus_cumplimiento": "ACTIVO o SUSPENDIDO (si es CSF) / POSITIVA o NEGATIVA (si es 32-D)",
-            "alertas": ["valor1"]
-        }
-        No incluyas texto fuera del JSON. Si no hay alertas, deja el arreglo vacío [].
-        """
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_seguro), prompt],
-            config=types.GenerateContentConfig(temperature=0.1)
-        )
-        return extraer_json(response.text)
-    except Exception as e:
-        logging.error(f"Error en /api/analista-csf: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
