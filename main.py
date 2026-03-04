@@ -21,6 +21,7 @@ app.add_middleware(
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
+# ---------------- MODELOS DE DATOS ----------------
 class SolicitudAnalisis(BaseModel):
     tipo_documento: str
     error_detectado: str
@@ -46,9 +47,33 @@ class SolicitudTasaEfectiva(BaseModel):
 class SolicitudAduana(BaseModel):
     conceptos: list
 
+# ---------------- MOTORES DE ESTABILIDAD ----------------
+
 def extraer_json(texto: str):
-    texto = re.sub(r'```json\n|```', '', texto).strip()
-    return json.loads(texto)
+    """Limpia la respuesta de la IA y extrae el JSON puro de forma quirúrgica."""
+    try:
+        # Intento 1: Quitar etiquetas markdown
+        texto_limpio = re.sub(r'```json\s*|```', '', texto).strip()
+        # Intento 2: Buscar llaves si hay texto residual
+        inicio = texto_limpio.find('{')
+        fin = texto_limpio.rfind('}')
+        if inicio != -1 and fin != -1:
+            return json.loads(texto_limpio[inicio:fin+1])
+        return json.loads(texto_limpio)
+    except Exception as e:
+        print(f"Error decodificando IA: {texto}")
+        raise ValueError("La respuesta de la IA no contiene un JSON válido.")
+
+def reparar_mime(filename: str, current_mime: str) -> str:
+    """Previene que Google rechace archivos por detección errónea del navegador."""
+    if not current_mime or current_mime == "application/octet-stream":
+        ext = filename.split('.')[-1].lower() if filename else ""
+        if ext == "pdf": return "application/pdf"
+        elif ext in ["jpg", "jpeg"]: return "image/jpeg"
+        elif ext in ["png"]: return "image/png"
+    return current_mime if current_mime else "application/pdf"
+
+# ---------------- ENDPOINTS GENERALES E IA ----------------
 
 @app.get("/ping")
 async def ping():
@@ -93,13 +118,15 @@ async def chat_asesor(datos: MensajeChat):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ---------------- ENDPOINTS OPERATIVOS Y MULTIMODALES ----------------
+
 @app.post("/api/ocr-fiscal")
 async def ocr_fiscal(archivos: List[UploadFile] = File(...)):
     try:
         resultados = []
         for archivo in archivos:
             file_bytes = await archivo.read()
-            mime_type = archivo.content_type
+            mime = reparar_mime(archivo.filename, archivo.content_type)
             prompt_ocr = """
             Paso 1: FILTRO DE CALIDAD. Si es ilegible devuelve EXACTAMENTE: {"error": "ERROR_CALIDAD_IMAGEN"}
             Paso 2: EXTRACCIÓN. Devuelve ÚNICAMENTE un JSON estricto: 
@@ -107,7 +134,7 @@ async def ocr_fiscal(archivos: List[UploadFile] = File(...)):
             """
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
-                contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt_ocr]
+                contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime), prompt_ocr]
             )
             
             try:
@@ -161,16 +188,15 @@ async def conciliacion_fuzzy(datos: DatosConciliacion):
     try:
         prompt = """
         Eres un motor Fuzzy Matching. Relaciona cobros/pagos con facturas por semántica y temporalidad.
-        Devuelve ÚNICAMENTE JSON VÁLIDO CON ESTA ESTRUCTURA EXACTA, sin texto adicional:
+        Devuelve ÚNICAMENTE JSON VÁLIDO CON ESTA ESTRUCTURA EXACTA:
         {"conciliados": [{"id_banco": "str", "uuid_factura": "str", "razonamiento": "str", "nivel_confianza": int}]}
-        Solo incluye coincidencias con nivel de confianza > 60.
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash', 
             contents=[prompt, json.dumps({"bancos": datos.bancos, "facturas": datos.facturas})],
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        return json.loads(response.text)
+        return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -178,19 +204,18 @@ async def conciliacion_fuzzy(datos: DatosConciliacion):
 async def validar_materialidad(contrato: UploadFile = File(...), datos_xml: str = Form(...)):
     try:
         file_bytes = await contrato.read()
-        mime_type = contrato.content_type
+        mime = reparar_mime(contrato.filename, contrato.content_type)
         prompt = f"""
         Auditor Forense (Art. 5-A). Cruza CONTRATO vs FACTURA XML: {datos_xml}.
-        REGLA ESTRICTA: Si el monto o la descripción del servicio estipulado en el contrato difiere sustancialmente del XML facturado, clasifica el riesgo como "ALTO" automáticamente por simulación de operaciones.
-        Devuelve ÚNICAMENTE un JSON válido con la siguiente estructura exacta:
+        Devuelve ÚNICAMENTE un JSON válido:
         {{"nivel_riesgo": "BAJO"|"MEDIO"|"ALTO", "porcentaje_coincidencia": int, "dictamen_defensa": "str", "hallazgos": ["str"]}}
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash', 
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        return json.loads(response.text)
+        return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -209,7 +234,7 @@ async def evaluar_tasa_efectiva(datos: SolicitudTasaEfectiva):
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        return json.loads(response.text)
+        return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -217,19 +242,18 @@ async def evaluar_tasa_efectiva(datos: SolicitudTasaEfectiva):
 async def auditoria_activos(foto: UploadFile = File(...), datos_xml: str = Form(...)):
     try:
         file_bytes = await foto.read()
-        mime_type = foto.content_type
+        mime = reparar_mime(foto.filename, foto.content_type)
         prompt = f"""
         Perito en materialidad fiscal. Analiza el activo en la FOTO y crúzalo contra el XML: {datos_xml}.
-        REGLA DE MERCADO: Evalúa estrictamente la razonabilidad económica. Si el objeto en la foto es de bajo valor (ej. un foco, una pluma) y el XML indica un monto absurdo (ej. $50,000), o si el XML factura "Servicios" pero la foto es un bien físico, MÁRCALO COMO DISCREPANCIA (coincidencia: false).
         Devuelve ÚNICAMENTE JSON: 
         {{"coincidencia": bool, "datos_extraidos_foto": "str", "dictamen_materialidad": "str"}}
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash', 
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        return json.loads(response.text)
+        return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -237,9 +261,7 @@ async def auditoria_activos(foto: UploadFile = File(...), datos_xml: str = Form(
 async def precios_aduana(datos: SolicitudAduana):
     try:
         prompt = f"""
-        Agente Aduanal ANAM. Conceptos XML a evaluar: {json.dumps(datos.conceptos)}.
-        BARRERA DE ENTRADA: Si los conceptos no corresponden a importación/exportación o no tienen complementos de comercio exterior evidentes, el riesgo es "BAJO" y el dictamen debe decir "Este XML no presenta características de operaciones aduaneras o de importación directa."
-        Si son de aduana, indica si existe subvaluación en valores unitarios frente a referencias internacionales.
+        Agente Aduanal ANAM. Conceptos XML: {json.dumps(datos.conceptos)}.
         Devuelve ÚNICAMENTE JSON: 
         {{"nivel_riesgo_aduanero": "ALTO"|"MEDIO"|"BAJO", "analisis_valoracion": "str"}}
         """
@@ -248,7 +270,7 @@ async def precios_aduana(datos: SolicitudAduana):
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        return json.loads(response.text)
+        return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -256,19 +278,18 @@ async def precios_aduana(datos: SolicitudAduana):
 async def prueba_servicio(evidencia: UploadFile = File(...), datos_xml: str = Form(...)):
     try:
         file_bytes = await evidencia.read()
-        mime_type = evidencia.content_type
+        mime = reparar_mime(evidencia.filename, evidencia.content_type)
         prompt = f"""
-        Auditor SAT (Art. 69-B). Evalúa evidencia adjunta contra XML: {datos_xml}.
-        Verifica congruencia y sustancia económica. 
+        Auditor SAT (Art. 69-B). Evalúa evidencia contra XML: {datos_xml}.
         Devuelve ÚNICAMENTE JSON: 
         {{"sustancia_economica_comprobada": bool, "nivel_riesgo_efos": "ALTO"|"MEDIO"|"BAJO", "dictamen_evidencia": "str"}}
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash', 
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        return json.loads(response.text)
+        return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -276,11 +297,9 @@ async def prueba_servicio(evidencia: UploadFile = File(...), datos_xml: str = Fo
 async def viaticos_geo(datos_xml: str = Form(...)):
     try:
         prompt = f"""
-        Auditor SAT (Art. 28 LISR, Fracción V). 
-        Calcula la distancia geoespacial entre el Código Postal del Emisor y el Código Postal del Receptor indicados en el siguiente XML: {datos_xml}.
-        REGLA: Los viáticos y gastos de viaje solo son deducibles si se erogan a una distancia de la faja de 50 kilómetros que circunde al establecimiento del contribuyente.
-        Valida además los topes diarios de alimentación ($750 MXN nacional, $1500 extranjero).
-        Devuelve ÚNICAMENTE JSON válido:
+        Auditor SAT (Art. 28 LISR). 
+        Calcula distancia geoespacial y viáticos del XML: {datos_xml}.
+        Devuelve ÚNICAMENTE JSON:
         {{"deducible": bool, "distancia_estimada_km": float, "limite_respetado": bool, "dictamen_viaticos": "str"}}
         """
         response = client.models.generate_content(
@@ -288,7 +307,7 @@ async def viaticos_geo(datos_xml: str = Form(...)):
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        return json.loads(response.text)
+        return extraer_json(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -296,20 +315,15 @@ async def viaticos_geo(datos_xml: str = Form(...)):
 async def defensa_legal(documento: UploadFile = File(...)):
     try:
         file_bytes = await documento.read()
-        mime_type = documento.content_type
+        mime = reparar_mime(documento.filename, documento.content_type)
         prompt = """
-        Eres un abogado fiscalista senior. El documento adjunto es un requerimiento, multa o Carta Invitación del SAT.
-        Redacta el borrador del oficio de aclaración o recurso de revocación formal para defender al contribuyente.
-        REGLA DE FORMATO INQUEBRANTABLE: Redacta un documento PROFESIONAL, crudo y directo. 
-        NO incluyas marcas de agua, ni texto como 'Generado por IA', ni asteriscos de markdown. Solo el texto legal puro listo para firma.
+        Eres un abogado fiscalista senior. Redacta borrador de oficio para defender al contribuyente.
+        NO incluyas marcas de agua ni asteriscos. Texto legal puro.
         """
         response = client.models.generate_content(
             model='gemini-2.5-pro',
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
-            config=types.GenerateContentConfig(
-                tools=[{"google_search": {}}],
-                temperature=0.2
-            )
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime), prompt],
+            config=types.GenerateContentConfig(tools=[{"google_search": {}}], temperature=0.2)
         )
         return {"oficio_legal": response.text.strip()}
     except Exception as e:
@@ -319,16 +333,11 @@ async def defensa_legal(documento: UploadFile = File(...)):
 async def banco_csv(documento: UploadFile = File(...)):
     try:
         file_bytes = await documento.read()
-        mime_type = documento.content_type
-        prompt = """
-        Eres un extractor financiero. Analiza el estado de cuenta bancario adjunto (PDF o Imagen).
-        Extrae todas las transacciones y devuélvelas ÚNICAMENTE en formato CSV con las siguientes columnas exactas:
-        Fecha (DD/MM/AAAA),Concepto,Cargo,Abono,Saldo
-        No incluyas texto adicional, ni saludos, ni bloques markdown. Solo el texto CSV puro.
-        """
+        mime = reparar_mime(documento.filename, documento.content_type)
+        prompt = """Extrae transacciones a CSV: Fecha (DD/MM/AAAA),Concepto,Cargo,Abono,Saldo"""
         response = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt]
+            contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime), prompt]
         )
         return {"csv_data": response.text.strip()}
     except Exception as e:
@@ -338,24 +347,16 @@ async def banco_csv(documento: UploadFile = File(...)):
 async def analista_csf(documento: UploadFile = File(...)):
     try:
         file_bytes = await documento.read()
-        mime = documento.content_type
-        if not mime or mime == "application/octet-stream":
-            mime = "application/pdf"
+        mime = reparar_mime(documento.filename, documento.content_type)
         
         prompt = """
         Analiza el documento fiscal.
-        Devuelve la información estrictamente en el siguiente formato JSON:
+        Devuelve ÚNICAMENTE JSON:
         {
-            "rfc": "",
-            "razon_social": "",
-            "regimen_fiscal": [],
-            "codigo_postal": "",
-            "estatus_cumplimiento": "",
-            "alertas": []
+            "rfc": "", "razon_social": "", "regimen_fiscal": [], "codigo_postal": "",
+            "estatus_cumplimiento": "", "alertas": []
         }
-        Reglas de extracción:
-        - estatus_cumplimiento: Si el documento es una Constancia de Situación Fiscal, escribe el 'Estatus en el padrón' (ej. ACTIVO). Si es una Opinión de Cumplimiento 32-D, escribe el sentido de la opinión (ej. POSITIVA o NEGATIVA).
-        - alertas: Si no hay irregularidades, devuelve un arreglo vacío.
+        Reglas: estatus_cumplimiento es 'Estatus en padrón' (CSF) o 'Sentido de opinión' (32-D).
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash',
