@@ -7,6 +7,13 @@ from typing import List
 import json
 import os
 import re
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 
 app = FastAPI(title="Motor Analítico AuditorIA", version="2.0")
 
@@ -19,9 +26,11 @@ app.add_middleware(
 )
 
 api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    logging.error("CRÍTICO: No se detectó GEMINI_API_KEY en las variables de entorno.")
+
 client = genai.Client(api_key=api_key)
 
-# ---------------- MODELOS DE DATOS ----------------
 class SolicitudAnalisis(BaseModel):
     tipo_documento: str
     error_detectado: str
@@ -47,9 +56,7 @@ class SolicitudTasaEfectiva(BaseModel):
 class SolicitudAduana(BaseModel):
     conceptos: list
 
-# ---------------- MOTORES DE BLINDAJE ----------------
 def extraer_json(texto: str):
-    """Extractor robusto que evita Errores 500 si la IA envía JSON con formato sucio."""
     texto_limpio = texto.strip()
     if texto_limpio.startswith("```json"):
         texto_limpio = texto_limpio[7:]
@@ -62,7 +69,6 @@ def extraer_json(texto: str):
     try:
         return json.loads(texto_limpio)
     except json.JSONDecodeError:
-        # Intento de extracción forense (cirugía) si falla el método estándar
         inicio = texto_limpio.find('{')
         fin = texto_limpio.rfind('}')
         if inicio != -1 and fin != -1:
@@ -76,15 +82,12 @@ def extraer_json(texto: str):
         raise ValueError("Imposible decodificar la estructura JSON de la IA")
 
 def reparar_mime_type(filename: str, current_mime: str) -> str:
-    """Fuerza el formato correcto del archivo para evitar rechazos de la API de Google."""
     if not current_mime or current_mime == "application/octet-stream":
         ext = filename.split('.')[-1].lower() if filename else ""
         if ext == "pdf": return "application/pdf"
         elif ext in ["jpg", "jpeg"]: return "image/jpeg"
         elif ext == "png": return "image/png"
     return current_mime if current_mime else "application/pdf"
-
-# ---------------- ENDPOINTS GENERALES E IA ----------------
 
 @app.get("/ping")
 async def ping():
@@ -128,8 +131,6 @@ async def chat_asesor(datos: MensajeChat):
         return {"respuesta": response.text.strip()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# ---------------- ENDPOINTS OPERATIVOS Y MULTIMODALES ----------------
 
 @app.post("/api/ocr-fiscal")
 async def ocr_fiscal(archivos: List[UploadFile] = File(...)):
@@ -412,31 +413,25 @@ async def analista_csf(documento: UploadFile = File(...)):
         mime_seguro = reparar_mime_type(documento.filename, documento.content_type)
         
         prompt = """
-        Auditor Fiscal. Analiza el documento adjunto.
-        Puede ser "Constancia de Situación Fiscal" (CSF) o "Opinión de Cumplimiento 32-D".
-        
+        Extrae los datos del documento (Constancia de Situación Fiscal o 32-D).
         Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta:
         {
-            "rfc": "string",
-            "razon_social": "string",
-            "regimen_fiscal": ["string"],
-            "codigo_postal": "string",
-            "tipo_documento": "string",
-            "estatus_cumplimiento": "string",
-            "alertas": ["string"]
+            "rfc": "valor",
+            "razon_social": "valor",
+            "regimen_fiscal": ["valor1"],
+            "codigo_postal": "valor",
+            "tipo_documento": "CSF o 32-D",
+            "estatus_cumplimiento": "ACTIVO o SUSPENDIDO (si es CSF) / POSITIVA o NEGATIVA (si es 32-D)",
+            "alertas": ["valor1"]
         }
-        
-        REGLAS DE OBLIGATORIO CUMPLIMIENTO:
-        1. El campo 'tipo_documento' debe decir "CSF" o "32-D".
-        2. Si es CSF: En 'estatus_cumplimiento' pon su estatus en el padrón ("ACTIVO" o "SUSPENDIDO").
-        3. Si es 32-D: En 'estatus_cumplimiento' pon "POSITIVA" o "NEGATIVA".
-        4. Si detectas irregularidades, inclúyelas como texto en el arreglo 'alertas'.
+        No incluyas texto fuera del JSON. Si no hay alertas, deja el arreglo vacío [].
         """
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_seguro), prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+            config=types.GenerateContentConfig(temperature=0.1)
         )
         return extraer_json(response.text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fallo interno en backend: {str(e)}")
+        logging.error(f"Error en /api/analista-csf: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
