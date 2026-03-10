@@ -8,6 +8,7 @@ from typing import List
 import json
 import os
 import logging
+import asyncio # <--- AÑADIDO PARA LA PAUSA DE SEGURIDAD
 
 # ---------------- CONFIGURACIÓN FORENSE Y LOGS ----------------
 logging.basicConfig(
@@ -37,7 +38,8 @@ async def global_exception_handler(request: Request, exc: Exception):
     logging.error(f"Fallo en {request.url.path}: {str(exc)}")
     return JSONResponse(
         status_code=500,
-        content={"status": "error", "codigo": "SYS_ERR", "mensaje": str(exc)}
+        content={"status": "error", "codigo": "SYS_ERR", "mensaje": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"} # <--- CORRECCIÓN DEL BUG CORS
     )
 
 # ---------------- MODELOS DE DATOS ----------------
@@ -158,6 +160,8 @@ async def ocr_fiscal(archivos: List[UploadFile] = File(...)):
                 resultados.append({"archivo": archivo.filename, "status": "success", "datos": datos})
         except:
             resultados.append({"archivo": archivo.filename, "status": "error", "mensaje": "Vectorización fallida."})
+            
+        await asyncio.sleep(2.5) # <--- PAUSA DE SEGURIDAD PARA EVITAR BANEO DE GOOGLE
             
     return resultados[0]["datos"] if len(resultados) == 1 and resultados[0]["status"] == "success" else {"status": "success_lote", "resultados_lote": resultados}
 
